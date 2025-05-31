@@ -1,0 +1,26 @@
+[project]
+name = "pythonproject"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Dark-Type",email = "SKAZHUTIN.N@MAIL.RU"}
+]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas (>=2.2.3,<3.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "notebook (>=7.4.3,<8.0.0)",
+    "torch (>=2.7.0,<3.0.0)",
+    "transformers (>=4.52.4,<5.0.0)",
+    "sentencepiece (>=0.2.0,<0.3.0)",
+    "iprogress (>=0.4,<0.5)",
+    "protobuf (>=6.31.1,<7.0.0)",
+    "scikit-learn (>=1.6.1,<2.0.0)",
+    "wandb (>=0.19.11,<0.20.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
