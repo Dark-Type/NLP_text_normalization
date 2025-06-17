@@ -1,0 +1,31 @@
+name: "rule_normalizer"
+backend: "python"
+max_batch_size: 64
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+output [
+  {
+    name: "NORMALIZED"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "CHANGED"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  }
+]
+dynamic_batching {
+  preferred_batch_size: [ 4, 16, 32, 64 ]
+}
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]

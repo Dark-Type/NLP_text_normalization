@@ -6,29 +6,15 @@ import torch
 import json
 import os
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from datetime import datetime
 from pathlib import Path
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from tqdm import tqdm
 
-# Advanced imports for T5 training
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
-from transformers import (
-    T5ForConditionalGeneration,
-    T5Tokenizer,
-    get_linear_schedule_with_warmup,
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    GPT2Tokenizer
-)
-from torch.optim import AdamW
-from sklearn.model_selection import train_test_split
+from transformers import T5ForConditionalGeneration, GPT2Tokenizer
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -39,40 +25,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@dataclass
-class TrainingConfig:
-    """Enhanced configuration for text normalization training."""
-    model_name: str = "ai-forever/ruT5-base"
-    max_source_length: int = 128
-    max_target_length: int = 128
-
-    batch_size: int = 8
-    learning_rate: float = 1e-4
-    num_epochs: int = 1
-    warmup_steps: int = 100
-    weight_decay: float = 0.05
-    gradient_clip_val: float = 0.5
-
-    sample_size: int = 15000
-    stratify_by_class: bool = True
-    stratify_by_length: bool = True
-
-    dataloader_num_workers: int = 4
-    mixed_precision: bool = True
-    compile_model: bool = False
-    pin_memory: bool = True
-    seed: int = 42
 
 class TextCleaner:
-    """ Text cleaner for dataset."""
+    """Text cleaner for dataset with improved handling of encoding issues."""
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.russian_letters = set('абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ')
         self.valid_chars = (
-            self.russian_letters |
-            set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') |
-            set(' .,!?-()[]{}\";:\'\"/@#$%^&*+=<>~`|\\€$₽°')
+                self.russian_letters |
+                set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') |
+                set(' .,!?-()[]{}\";:\'\"/@#$%^&*+=<>~`|\\€$₽°')
         )
 
     def safe_load_csv(self, file_path: str) -> pd.DataFrame:
@@ -99,143 +62,83 @@ class TextCleaner:
             self.logger.error(f"All encoding attempts failed: {e}")
             return None
 
-    def clean_dataset(self, df: pd.DataFrame, aggressive_cleaning: bool = False) -> pd.DataFrame:
-        """Clean Russian text normalization dataset with character handling."""
-        self.logger.info(f"Starting robust cleaning of {len(df)} rows")
-        original_size = len(df)
+    def clean_dataset(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean dataset with improved handling."""
+        if df is None:
+            self.logger.error("DataFrame is None, cannot clean")
+            return None
 
-        df = self._handle_basic_issues(df)
-        df = self._fix_character_encoding(df)
-        df = self._clean_problematic_characters(df, gentle=True)
-
-        if aggressive_cleaning:
-            df = self._validate_normalizations(df)
-
-        df = self._handle_clear_duplicates(df)
-        df = self._minimal_final_cleanup(df)
-
-        cleaned_size = len(df)
-        removal_percentage = ((original_size - cleaned_size) / original_size) * 100
-        self.logger.info(f"Cleaning complete: {original_size} -> {cleaned_size} rows "
-                        f"({removal_percentage:.1f}% removed)")
-
-        return df.reset_index(drop=True)
-
-    def _handle_basic_issues(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle basic data integrity issues."""
-        required_cols = ['before', 'after']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
+        self.logger.info(f"Starting dataset cleaning of {len(df)} rows")
 
         df['before'] = df['before'].astype(str).replace('nan', '')
         df['after'] = df['after'].astype(str).replace('nan', '')
 
+        df['before'] = df['before'].apply(self._fix_encoding)
+        df['after'] = df['after'].apply(self._fix_encoding)
+
         initial_len = len(df)
         df = df[(df['before'].str.strip() != '') & (df['after'].str.strip() != '')]
-        self.logger.info(f"Removed {initial_len - len(df)} clearly empty rows")
+        self.logger.info(f"Removed {initial_len - len(df)} empty rows")
 
-        return df
+        df['before'] = df['before'].apply(self._clean_text)
+        df['after'] = df['after'].apply(self._clean_text)
 
-    def _fix_character_encoding(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fix character encoding issues."""
-        def fix_encoding(text):
-            if pd.isna(text):
-                return ""
-
-            text = str(text)
-
-            try:
-                text = unicodedata.normalize('NFKC', text)
-            except:
-                pass
-
-            encoding_fixes = {
-                'Ã¡': 'а', 'Ã ': 'а', 'Ã«': 'е', 'Ã¬': 'и', 'Ã®': 'о', 'Ã³': 'у',
-                'â€œ': '"', 'â€': '"', 'â€™': "'", 'â€"': '–', 'â€"': '—'
-            }
-
-            for wrong, correct in encoding_fixes.items():
-                text = text.replace(wrong, correct)
-
-            return text
-
-        df['before'] = df['before'].apply(fix_encoding)
-        df['after'] = df['after'].apply(fix_encoding)
-
-        return df
-
-    def _clean_problematic_characters(self, df: pd.DataFrame, gentle: bool = True) -> pd.DataFrame:
-        """Remove problematic characters with gentle approach."""
-        def clean_text(text, gentle_mode=True):
-            if pd.isna(text):
-                return ""
-
-            text = str(text)
-
-            if gentle_mode:
-                problematic_chars = set(['', '', '', '﻿', '\x00', '\x01', '\x02', '\x03'])
-                text = ''.join(char for char in text if char not in problematic_chars)
-                text = re.sub(r'\s+', ' ', text).strip()
-            else:
-                text = ''.join(char for char in text if char in self.valid_chars or char.isspace())
-                text = re.sub(r'\s+', ' ', text).strip()
-
-            return text
-
-        initial_len = len(df)
-
-        df['before'] = df['before'].apply(lambda x: clean_text(x, gentle))
-        df['after'] = df['after'].apply(lambda x: clean_text(x, gentle))
-
-        df = df[(df['before'].str.strip() != '') & (df['after'].str.strip() != '')]
-
-        self.logger.info(f"Character cleaning removed {initial_len - len(df)} rows")
-        return df
-
-    def _validate_normalizations(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate normalizations"""
-        initial_len = len(df)
-
-        def is_valid_normalization(before, after):
-            if len(after) > len(before) * 5:
-                return False
-            if len(after) < len(before) * 0.1 and len(before) > 10:
-                return False
-            return True
-
-        mask = df.apply(lambda row: is_valid_normalization(row['before'], row['after']), axis=1)
-        df = df[mask]
-
-        self.logger.info(f"Normalization validation removed {initial_len - len(df)} rows")
-        return df
-
-    def _handle_clear_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle only clear duplicates."""
         initial_len = len(df)
         df = df.drop_duplicates(subset=['before', 'after'])
-        self.logger.info(f"Duplicate removal: {initial_len - len(df)} exact duplicates removed")
-        return df
+        self.logger.info(f"Removed {initial_len - len(df)} duplicates")
 
-    def _minimal_final_cleanup(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Minimal final cleanup."""
-        initial_len = len(df)
-        df = df[df['before'].str.len() <= 500]
-        df = df[df['after'].str.len() <= 600]
-        self.logger.info(f"Final cleanup removed {initial_len - len(df)} overly long texts")
-        return df
+        return df.reset_index(drop=True)
+
+    def _fix_encoding(self, text: str) -> str:
+        """Fix common encoding issues in text."""
+        if pd.isna(text):
+            return ""
+
+        text = str(text)
+
+        try:
+            text = unicodedata.normalize('NFKC', text)
+        except:
+            pass
+
+        fixes = {
+            'Ã¡': 'а', 'Ã ': 'а', 'Ã«': 'е', 'Ã¬': 'и', 'Ã®': 'о', 'Ã³': 'у',
+            'â€œ': '"', 'â€': '"', 'â€™': "'", 'â€"': '–', 'â€"': '—',
+            '\u200b': '', '\ufeff': '', '\xa0': ' '
+        }
+
+        for wrong, correct in fixes.items():
+            text = text.replace(wrong, correct)
+
+        return text
+
+    def _clean_text(self, text: str) -> str:
+        """Clean problematic characters from text."""
+        if pd.isna(text):
+            return ""
+
+        text = str(text)
+
+        problematic_chars = set(['', '', '', '﻿', '\x00', '\x01', '\x02', '\x03'])
+        text = ''.join(char for char in text if char not in problematic_chars)
+
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
 
 class My_TextNormalization_Model:
     """
-    Enhanced Russian text normalization model combining rule-based and neural approaches.
+    Enhanced Russian text normalization model with improved accuracy.
     """
 
     def __init__(self):
         """Initialize the enhanced text normalization model."""
-        logger.info("Initializing Advanced Russian Text Normalization Model")
+        logger.info("Initializing Enhanced Russian Text Normalization Model")
 
-        # File paths
         self.dictionary_path = 'data/dictionary/model_dictionary.json'
+        self.class_dict_path = 'data/dictionary/class_dictionaries.json'
+        self.special_dict_path = 'data/dictionary/special_cases.json'
         self.results_path = 'data/results.csv'
         self.train_path = 'data/ru_train.csv'
         self.test_path = 'data/ru_test_2.csv'
@@ -247,6 +150,19 @@ class My_TextNormalization_Model:
 
         self.cleaner = TextCleaner()
 
+        self.general_dict = {}
+        self.class_dictionaries = {}
+        self.special_cases = {}
+
+        self._init_rule_resources()
+
+        self.model_name = "saarus72/russian_text_normalizer"
+        self.tokenizer = None
+        self.model = None
+        self.device = None
+
+    def _init_rule_resources(self):
+        """Initialize resources for rule-based normalization."""
         self.numbers = {
             '0': 'ноль', '1': 'один', '2': 'два', '3': 'три', '4': 'четыре',
             '5': 'пять', '6': 'шесть', '7': 'семь', '8': 'восемь', '9': 'девять',
@@ -276,7 +192,20 @@ class My_TextNormalization_Model:
             '27': 'двадцать седьмое', '28': 'двадцать восьмое', '29': 'двадцать девятое',
             '30': 'тридцатое', '31': 'тридцать первое'
         }
-
+        self.centuries = {
+            '19': 'девятнадцатый',
+            '18': 'восемнадцатый',
+            '17': 'семнадцатый',
+            '20': 'двадцатый',
+            '21': 'двадцать первый'
+        }
+        self.special_years = {
+            '1812': 'тысяча восемьсот двенадцатый',
+            '1917': 'тысяча девятьсот семнадцатый',
+            '1941': 'тысяча девятьсот сорок первый',
+            '1945': 'тысяча девятьсот сорок пятый',
+            '2000': 'двухтысячный'
+        }
         self.months = {
             '1': 'января', '2': 'февраля', '3': 'марта', '4': 'апреля',
             '5': 'мая', '6': 'июня', '7': 'июля', '8': 'августа',
@@ -295,62 +224,240 @@ class My_TextNormalization_Model:
             'XVIII': 'восемнадцатый', 'XIX': 'девятнадцатый', 'XX': 'двадцатый'
         }
 
-        logger.info("Advanced Russian Text Normalization Model initialized successfully")
+        self.abbreviations = {
+            'т.е.': 'то есть', 'и т.д.': 'и так далее', 'и т.п.': 'и тому подобное',
+            'т.к.': 'так как', 'т.н.': 'так называемый', 'см.': 'смотрите',
+            'стр.': 'страница', 'гл.': 'глава', 'рис.': 'рисунок',
+            'табл.': 'таблица', 'г.': 'год', 'гг.': 'годы', 'в.': 'век',
+            'вв.': 'века', 'др.': 'другие', 'пр.': 'прочие',
+            'напр.': 'например', 'англ.': 'английский', 'рус.': 'русский',
+            'обл.': 'область', 'р-н': 'район', 'пос.': 'поселок', 'с.': 'село',
+            'пр-т': 'проспект', 'ул.': 'улица', 'тыс.': 'тысяч', 'млн.': 'миллионов',
+            'млрд.': 'миллиардов', 'руб.': 'рублей', 'коп.': 'копеек',
+            'св.': 'святой', 'им.': 'имени', 'проф.': 'профессор',
+            'акад.': 'академик', 'доц.': 'доцент', 'тел.': 'телефон'
+        }
 
-    def train_enhanced_dict(self):
-        """Create enhanced dictionary with robust data cleaning."""
+        self.currency_symbols = {
+            '₽': 'рублей', 'руб': 'рублей', '$': 'долларов', '€': 'евро',
+            'USD': 'долларов', 'EUR': 'евро', 'RUB': 'рублей'
+        }
+
+        self.gendered_words = {
+            'один': {'masculine': 'один', 'feminine': 'одна', 'neuter': 'одно'},
+            'два': {'masculine': 'два', 'feminine': 'две', 'neuter': 'два'}
+        }
+
+    def train_dict(self):
+        """Create improved dictionary with better class awareness."""
         logger.info("Starting enhanced dictionary creation...")
 
-        # Load and clean training data
         train_df = self.cleaner.safe_load_csv(self.train_path)
         if train_df is None:
             logger.error("Failed to load training data")
             return
 
-        train_df = self.cleaner.clean_dataset(train_df, aggressive_cleaning=False)
+        train_df = self.cleaner.clean_dataset(train_df)
 
         train_df['before'] = train_df['before'].str.lower()
         train_df['after'] = train_df['after'].str.lower()
+
         train_df['after_c'] = train_df['after'].map(lambda x: len(str(x).split()))
         train_df = train_df[~((train_df['class'] == 'LETTERS') & (train_df['after_c'] > 4))]
 
-        train_df = train_df.groupby(['before', 'after'], as_index=False)['sentence_id'].count()
-        train_df = train_df.sort_values(['sentence_id', 'before'], ascending=[False, True])
-        train_df = train_df.drop_duplicates(['before'])
+        self._create_general_dictionary(train_df)
 
-        dictionary = {key: value for (key, value) in train_df[['before', 'after']].values}
-        logger.info(f"Dictionary created with {len(dictionary)} entries")
+        self._create_class_dictionaries(train_df)
+
+        self._extract_special_cases(train_df)
 
         try:
             with open(self.dictionary_path, 'w', encoding='utf-8') as f:
-                json.dump(dictionary, f, indent=4, ensure_ascii=False)
-            logger.info(f"Dictionary saved to {self.dictionary_path}")
+                json.dump(self.general_dict, f, indent=4, ensure_ascii=False)
+
+            with open(self.class_dict_path, 'w', encoding='utf-8') as f:
+                json.dump(self.class_dictionaries, f, indent=4, ensure_ascii=False)
+
+            with open(self.special_dict_path, 'w', encoding='utf-8') as f:
+                json.dump(self.special_cases, f, indent=4, ensure_ascii=False)
+
+            logger.info(f"Dictionaries saved successfully")
         except Exception as e:
-            logger.error(f"Failed to save dictionary: {e}")
+            logger.error(f"Failed to save dictionaries: {e}")
 
         logger.info("Enhanced dictionary creation completed successfully")
 
+    def _create_general_dictionary(self, df: pd.DataFrame):
+        """Create general dictionary - original approach which works well."""
+        train_df = df.groupby(['before', 'after'], as_index=False)['sentence_id'].count()
+        train_df = train_df.sort_values(['sentence_id', 'before'], ascending=[False, True])
+        train_df = train_df.drop_duplicates(['before'])
+        self.general_dict = {key: value for (key, value) in train_df[['before', 'after']].values}
+        logger.info(f"General dictionary created with {len(self.general_dict)} entries")
+
+    def _create_class_dictionaries(self, df: pd.DataFrame):
+        """Create specialized dictionaries for each token class."""
+        self.class_dictionaries = {}
+
+        for class_name, class_df in df.groupby('class'):
+            if len(class_df) < 10:
+                continue
+
+            class_counts = class_df.groupby(['before', 'after']).size().reset_index(name='count')
+            class_counts = class_counts.sort_values(['before', 'count'], ascending=[True, False])
+
+            class_dict = {}
+            for before, group in class_counts.groupby('before'):
+                most_frequent = group.iloc[0]
+                class_dict[before] = most_frequent['after']
+
+            self.class_dictionaries[class_name] = class_dict
+            logger.info(f"Class dictionary for '{class_name}' created with {len(class_dict)} entries")
+
+    def _extract_special_cases(self, df: pd.DataFrame):
+        """Extract special cases that need custom handling."""
+        special_cases = {}
+
+        ambiguous = df.groupby('before')['after'].nunique()
+        ambiguous = ambiguous[ambiguous > 1].index.tolist()
+
+        for token in ambiguous[:1000]:
+            normalizations = df[df['before'] == token][['after', 'class']].drop_duplicates()
+            if len(normalizations) <= 1:
+                continue
+
+            norm_dict = {}
+            for _, row in normalizations.iterrows():
+                cls = row['class'] if not pd.isna(row['class']) else 'UNKNOWN'
+                norm_dict[cls] = row['after']
+
+            special_cases[token] = norm_dict
+
+        self.special_cases = special_cases
+        logger.info(f"Extracted {len(special_cases)} special cases with context-dependent normalizations")
+
+    def load_dictionaries(self):
+        """Load all dictionaries from files."""
+        try:
+            with open(self.dictionary_path, 'r', encoding='utf-8') as f:
+                self.general_dict = json.load(f)
+                logger.info(f"General dictionary loaded with {len(self.general_dict)} entries")
+        except Exception as e:
+            logger.warning(f"Failed to load general dictionary: {e}")
+            self.general_dict = {}
+
+        try:
+            with open(self.class_dict_path, 'r', encoding='utf-8') as f:
+                self.class_dictionaries = json.load(f)
+                logger.info(f"Class dictionaries loaded: {list(self.class_dictionaries.keys())}")
+        except Exception as e:
+            logger.warning(f"Failed to load class dictionaries: {e}")
+            self.class_dictionaries = {}
+
+        try:
+            with open(self.special_dict_path, 'r', encoding='utf-8') as f:
+                self.special_cases = json.load(f)
+                logger.info(f"Special cases loaded: {len(self.special_cases)} items")
+        except Exception as e:
+            logger.warning(f"Failed to load special cases: {e}")
+            self.special_cases = {}
+
+    def normalize_text_dict(self):
+        """Normalize text using improved dictionary approach."""
+        logger.info("Starting dictionary-based normalization...")
+
+        if not self.general_dict:
+            self.load_dictionaries()
+
+        try:
+            test = self.cleaner.safe_load_csv(self.test_path)
+            if test is None:
+                logger.error("Failed to load test data")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to load test data: {e}")
+            return None
+
+        test['id'] = test['sentence_id'].astype(str) + '_' + test['token_id'].astype(str)
+        test['before_l'] = test['before'].str.lower()
+
+        def normalize_token(row):
+            token = row['before_l']
+            token_class = row.get('class', '')
+
+            if pd.isna(token) or token is None:
+                return ''
+
+            if token_class and token_class in self.class_dictionaries and token in self.class_dictionaries[token_class]:
+                return self.class_dictionaries[token_class][token]
+
+            if token in self.special_cases and token_class in self.special_cases[token]:
+                return self.special_cases[token][token_class]
+
+            if token in self.general_dict:
+                return self.general_dict[token]
+
+            if any(c.isdigit() or (c.isascii() and c.isalpha()) for c in token):
+                rule_result = self.normalize_with_rules(token)
+                if rule_result != token:
+                    return rule_result
+
+            return token
+
+        test['after'] = test.apply(normalize_token, axis=1)
+
+        def fix_case(original, lower, after):
+            if pd.isna(original) or pd.isna(lower) or pd.isna(after):
+                return "" if pd.isna(original) else original
+
+            if lower == after:
+                return original
+            else:
+                return after
+
+        test['after'] = test.apply(lambda r: fix_case(r['before'], r['before_l'], r['after']), axis=1)
+
+        logger.info("Dictionary-based normalization completed")
+        return test
+
     def normalize_with_rules(self, text: str) -> str:
-        """Apply rule-based normalization to text."""
-        if not text or not isinstance(text, str):
+        """Apply rule-based normalization with improved handling."""
+        if not text or not isinstance(text, str) or pd.isna(text):
             return ""
 
         try:
+            if re.match(r'\d{1,2}[./]\d{1,2}[./]\d{4}', text):
+                return self._normalize_dates(text)
+
+            if re.match(r'\d{1,2}:\d{2}', text):
+                return self._normalize_time(text)
+
+            if re.match(r'\d+\s*(?:[₽$€]|руб\.?)', text):
+                return self._normalize_currency(text)
+
+            if re.match(r'\d+(?:[.,]\d+)?\s*%', text):
+                return self._normalize_percentages(text)
+
+            if re.match(r'\d+(?:[.,]\d+)?\s*(?:кг|г|км|м|см|мм|л|мл|°C|°)', text):
+                return self._normalize_measurements(text)
+
+            if re.match(r'(?:\+7|8)\s*(?:\d{10}|\(\d{3}\)\s*\d{3}-\d{2}-\d{2})', text):
+                return self._normalize_phone_numbers(text)
+
+            if re.match(r'\b(I{1,3}|IV|V|VI{0,3}|IX|X{1,2}|XI{0,3}|XIV|XV|XVI{0,3}|XIX|XX)\b', text):
+                return self._normalize_roman_numerals(text)
+
+            if re.match(r'\b\d{1,6}\b', text):
+                return self._normalize_numbers(text)
+
             normalized_text = self._preprocess_text(text)
-            normalized_text = self._normalize_dates(normalized_text)
-            normalized_text = self._normalize_time(normalized_text)
-            normalized_text = self._normalize_currency(normalized_text)
-            normalized_text = self._normalize_measurements(normalized_text)
-            normalized_text = self._normalize_percentages(normalized_text)
-            normalized_text = self._normalize_phone_numbers(normalized_text)
-            normalized_text = self._normalize_urls_emails(normalized_text)
             normalized_text = self._normalize_abbreviations(normalized_text)
-            normalized_text = self._normalize_roman_numerals(normalized_text)
-            normalized_text = self._normalize_numbers(normalized_text)
+            normalized_text = self._normalize_urls_emails(normalized_text)
             normalized_text = self._normalize_punctuation(normalized_text)
             normalized_text = self._postprocess_text(normalized_text)
 
             return normalized_text
+
         except Exception as e:
             logger.error(f"Error during rule-based normalization: {str(e)}")
             return text
@@ -365,182 +472,234 @@ class My_TextNormalization_Model:
 
     def _normalize_dates(self, text: str) -> str:
         """Normalize dates in various formats."""
-        def convert_date(match):
-            day, month, year = match.groups()
+        date_match = re.match(r'(\d{1,2})[./](\d{1,2})[./](\d{4})', text)
+        if date_match:
+            day, month, year = date_match.groups()
             day_word = self.ordinals.get(str(int(day)), f"{day}-е")
             month_word = self.months.get(str(int(month)), month)
             year_word = self._convert_year(year)
             return f"{day_word} {month_word} {year_word} года"
 
-        text = re.sub(r'\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b', convert_date, text)
-
-        def convert_short_date(match):
-            day, month = match.groups()
+        short_date_match = re.match(r'(\d{1,2})[./](\d{1,2})(?!/)', text)
+        if short_date_match:
+            day, month = short_date_match.groups()
             day_word = self.ordinals.get(str(int(day)), f"{day}-е")
             month_word = self.months.get(str(int(month)), month)
             return f"{day_word} {month_word}"
 
-        text = re.sub(r'\b(\d{1,2})[./](\d{1,2})\b(?!/)', convert_short_date, text)
         return text
 
     def _normalize_time(self, text: str) -> str:
-        """Normalize time expressions."""
-        def convert_time(match):
-            hours, minutes = match.groups()
+        """Normalize time expressions with correct grammatical forms."""
+        time_match = re.match(r'(\d{1,2}):(\d{2})', text)
+        if time_match:
+            hours, minutes = time_match.groups()
             hour_int = int(hours)
             minute_int = int(minutes)
 
-            hour_word = self._number_to_words(hour_int)
+            if hour_int == 1:
+                hour_word = "один час"
+            elif 2 <= hour_int <= 4:
+                hour_word = f"{self._number_to_words(hour_int)} часа"
+            else:
+                hour_word = f"{self._number_to_words(hour_int)} часов"
 
             if minute_int == 0:
-                return f"{hour_word} часов"
+                return hour_word
             else:
-                minute_word = self._number_to_words(minute_int)
-                return f"{hour_word} часов {minute_word} минут"
+                if minute_int == 1:
+                    minute_word = "одна минута"
+                elif 2 <= minute_int <= 4:
+                    minute_word = f"{self._number_to_words(minute_int)} минуты"
+                else:
+                    minute_word = f"{self._number_to_words(minute_int)} минут"
+                return f"{hour_word} {minute_word}"
 
-        text = re.sub(r'\b(\d{1,2}):(\d{2})\b', convert_time, text)
         return text
 
     def _normalize_currency(self, text: str) -> str:
-        """Normalize currency expressions."""
-        def convert_currency(match):
-            amount, currency = match.groups()
+        """Normalize currency expressions with correct grammatical forms."""
+        currency_match = re.match(r'(\d+)\s*([₽$€]|руб\.?)', text)
+        if currency_match:
+            amount, currency = currency_match.groups()
             amount_int = int(amount)
             amount_word = self._number_to_words(amount_int)
 
             if currency == '₽' or currency == 'руб':
-                if amount_int == 1:
+                if amount_int % 10 == 1 and amount_int % 100 != 11:
                     currency_word = 'рубль'
-                elif 2 <= amount_int <= 4:
+                elif 2 <= amount_int % 10 <= 4 and (amount_int % 100 < 10 or amount_int % 100 >= 20):
                     currency_word = 'рубля'
                 else:
                     currency_word = 'рублей'
             elif currency == '$':
-                if amount_int == 1:
+                if amount_int % 10 == 1 and amount_int % 100 != 11:
                     currency_word = 'доллар'
-                elif 2 <= amount_int <= 4:
+                elif 2 <= amount_int % 10 <= 4 and (amount_int % 100 < 10 or amount_int % 100 >= 20):
                     currency_word = 'доллара'
                 else:
                     currency_word = 'долларов'
             elif currency == '€':
                 currency_word = 'евро'
             else:
-                currency_word = currency
+                currency_word = self.currency_symbols.get(currency, currency)
 
             return f"{amount_word} {currency_word}"
 
-        text = re.sub(r'(\d+)\s*([₽$€]|руб\.?)', convert_currency, text)
-
-        def convert_decimal_currency(match):
-            amount, currency = match.groups()
+        decimal_currency_match = re.match(r'(\d+[.,]\d+)\s*([₽$€]|руб\.?)', text)
+        if decimal_currency_match:
+            amount, currency = decimal_currency_match.groups()
             amount_word = self._convert_decimal_number(amount)
-            currency_word = self._get_currency_word(currency)
+            currency_word = self.currency_symbols.get(currency, currency)
             return f"{amount_word} {currency_word}"
 
-        text = re.sub(r'(\d+[.,]\d+)\s*([₽$€]|руб\.?)', convert_decimal_currency, text)
         return text
 
     def _normalize_measurements(self, text: str) -> str:
-        """Normalize measurement units."""
-        def convert_measurement(match):
-            amount, unit = match.groups()
+        """Normalize measurement units with correct grammatical forms."""
+        measurement_match = re.match(r'(\d+(?:[.,]\d+)?)\s*(кг|г|км|м|см|мм|л|мл|°C|°)', text)
+        if measurement_match:
+            amount, unit = measurement_match.groups()
 
             if '.' in amount or ',' in amount:
                 amount_word = self._convert_decimal_number(amount)
+                unit_mappings = {
+                    'кг': 'килограммов', 'г': 'граммов', 'км': 'километров',
+                    'м': 'метров', 'см': 'сантиметров', 'мм': 'миллиметров',
+                    'л': 'литров', 'мл': 'миллилитров', '°C': 'градусов цельсия',
+                    '°': 'градусов'
+                }
+                unit_word = unit_mappings.get(unit, unit)
             else:
-                amount_word = self._number_to_words(int(amount))
+                amount_int = int(amount)
+                amount_word = self._number_to_words(amount_int)
 
-            unit_mappings = {
-                'кг': 'килограммов', 'г': 'граммов', 'км': 'километров',
-                'м': 'метров', 'см': 'сантиметров', 'мм': 'миллиметров',
-                'л': 'литров', 'мл': 'миллилитров', '°C': 'градусов цельсия',
-                '°': 'градусов'
-            }
+                if unit in ['кг', 'г', 'км', 'м', 'см', 'мм', 'л', 'мл']:
+                    if amount_int % 10 == 1 and amount_int % 100 != 11:
+                        unit_mappings = {
+                            'кг': 'килограмм', 'г': 'грамм', 'км': 'километр',
+                            'м': 'метр', 'см': 'сантиметр', 'мм': 'миллиметр',
+                            'л': 'литр', 'мл': 'миллилитр'
+                        }
+                    elif 2 <= amount_int % 10 <= 4 and (amount_int % 100 < 10 or amount_int % 100 >= 20):
+                        unit_mappings = {
+                            'кг': 'килограмма', 'г': 'грамма', 'км': 'километра',
+                            'м': 'метра', 'см': 'сантиметра', 'мм': 'миллиметра',
+                            'л': 'литра', 'мл': 'миллилитра'
+                        }
+                    else:
+                        unit_mappings = {
+                            'кг': 'килограммов', 'г': 'граммов', 'км': 'километров',
+                            'м': 'метров', 'см': 'сантиметров', 'мм': 'миллиметров',
+                            'л': 'литров', 'мл': 'миллилитров'
+                        }
+                else:
+                    unit_mappings = {
+                        '°C': 'градусов цельсия',
+                        '°': 'градусов' if amount_int != 1 else 'градус'
+                    }
 
-            unit_word = unit_mappings.get(unit, unit)
+                unit_word = unit_mappings.get(unit, unit)
+
             return f"{amount_word} {unit_word}"
 
-        text = re.sub(r'(\d+(?:[.,]\d+)?)\s*(кг|г|км|м|см|мм|л|мл|°C|°)', convert_measurement, text)
         return text
 
     def _normalize_percentages(self, text: str) -> str:
-        """Normalize percentage expressions."""
-        def convert_percentage(match):
-            amount = match.group(1)
+        """Normalize percentage expressions with correct grammatical forms."""
+        percentage_match = re.match(r'(\d+(?:[.,]\d+)?)%', text)
+        if percentage_match:
+            amount = percentage_match.group(1)
+
             if '.' in amount or ',' in amount:
                 amount_word = self._convert_decimal_number(amount)
+                return f"{amount_word} процентов"
             else:
-                amount_word = self._number_to_words(int(amount))
-            return f"{amount_word} процентов"
+                amount_int = int(amount)
+                amount_word = self._number_to_words(amount_int)
 
-        text = re.sub(r'(\d+(?:[.,]\d+)?)%', convert_percentage, text)
+                if amount_int % 10 == 1 and amount_int % 100 != 11:
+                    return f"{amount_word} процент"
+                elif 2 <= amount_int % 10 <= 4 and (amount_int % 100 < 10 or amount_int % 100 >= 20):
+                    return f"{amount_word} процента"
+                else:
+                    return f"{amount_word} процентов"
+
         return text
 
     def _normalize_phone_numbers(self, text: str) -> str:
-        """Normalize phone numbers."""
-        def convert_phone(match):
-            phone = match.group()
-            digits = re.sub(r'[^\d]', '', phone)
-            spoken_digits = []
-            for digit in digits:
-                spoken_digits.append(self.numbers.get(digit, digit))
-            return ' '.join(spoken_digits)
+        """Normalize phone numbers with better formatting."""
+        phone_match = re.match(r'(?:\+7|8)\s*(?:\d{10}|\(\d{3}\)\s*\d{3}-\d{2}-\d{2})', text)
+        if phone_match:
+            digits = re.sub(r'[^\d]', '', text)
 
-        phone_patterns = [
-            r'\+7\s*\(\d{3}\)\s*\d{3}-\d{2}-\d{2}',
-            r'\+7\s*\d{10}',
-            r'8\s*\(\d{3}\)\s*\d{3}-\d{2}-\d{2}',
-            r'8\s*\d{10}'
-        ]
+            formatted_digits = []
 
-        for pattern in phone_patterns:
-            text = re.sub(pattern, convert_phone, text)
+            if digits.startswith('7') or digits.startswith('8'):
+                formatted_digits.append(self.numbers.get(digits[0], digits[0]))
+                digits = digits[1:]
+
+            i = 0
+            while i < len(digits):
+                if i + 2 <= len(digits):
+                    pair = digits[i:i + 2]
+                    if pair[0] != '0' and int(pair) <= 19:
+                        formatted_digits.append(self._number_to_words(int(pair)))
+                    else:
+                        formatted_digits.append(self.numbers.get(pair[0], pair[0]))
+                        formatted_digits.append(self.numbers.get(pair[1], pair[1]))
+                else:
+                    formatted_digits.append(self.numbers.get(digits[i], digits[i]))
+                i += 2
+
+            return ' '.join(formatted_digits)
 
         return text
 
     def _normalize_urls_emails(self, text: str) -> str:
         """Normalize URLs and email addresses."""
-        text = re.sub(r'https?://[^\s]+', 'ссылка', text)
-        text = re.sub(r'www\.[^\s]+', 'веб сайт', text)
-        text = re.sub(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', 'электронная почта', text)
+        if re.match(r'https?://[^\s]+', text):
+            return 'ссылка'
+
+        if re.match(r'www\.[^\s]+', text):
+            return 'веб сайт'
+
+        if re.match(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', text):
+            return 'электронная почта'
+
         return text
 
     def _normalize_abbreviations(self, text: str) -> str:
         """Normalize common abbreviations."""
-        abbreviations = {
-            'т.е.': 'то есть', 'и т.д.': 'и так далее', 'и т.п.': 'и тому подобное',
-            'т.к.': 'так как', 'т.н.': 'так называемый', 'см.': 'смотрите',
-            'стр.': 'страница', 'гл.': 'глава', 'рис.': 'рисунок',
-            'табл.': 'таблица', 'г.': 'год', 'гг.': 'годы', 'в.': 'век',
-            'вв.': 'века', 'др.': 'другие', 'пр.': 'прочие',
-            'напр.': 'например', 'англ.': 'английский', 'рус.': 'русский'
-        }
+        for abbr, expansion in sorted(self.abbreviations.items(), key=lambda x: len(x[0]), reverse=True):
+            if text.lower() == abbr.lower():
+                return expansion
 
-        for abbr, expansion in abbreviations.items():
-            text = re.sub(r'\b' + re.escape(abbr) + r'\b', expansion, text, flags=re.IGNORECASE)
+        for abbr, expansion in sorted(self.abbreviations.items(), key=lambda x: len(x[0]), reverse=True):
+            if re.search(r'\b' + re.escape(abbr) + r'\b', text, re.IGNORECASE):
+                text = re.sub(r'\b' + re.escape(abbr) + r'\b', expansion, text, flags=re.IGNORECASE)
 
         return text
 
     def _normalize_roman_numerals(self, text: str) -> str:
-        """Normalize Roman numerals."""
-        def convert_roman(match):
-            roman = match.group()
+        """Normalize Roman numerals with contextual awareness."""
+        roman_match = re.match(r'\b(I{1,3}|IV|V|VI{0,3}|IX|X{1,2}|XI{0,3}|XIV|XV|XVI{0,3}|XIX|XX)\b', text)
+        if roman_match:
+            roman = roman_match.group(1)
             return self.roman_numerals.get(roman, roman)
 
-        text = re.sub(r'\b(I{1,3}|IV|V|VI{0,3}|IX|X{1,2}|XI{0,3}|XIV|XV|XVI{0,3}|XIX|XX)\b', convert_roman, text)
         return text
 
     def _normalize_numbers(self, text: str) -> str:
         """Normalize standalone numbers to words."""
-        def convert_number(match):
-            number = match.group()
+        number_match = re.match(r'\b\d{1,6}\b', text)
+        if number_match:
             try:
-                num = int(number)
+                num = int(text)
                 return self._number_to_words(num)
             except ValueError:
-                return number
+                pass
 
-        text = re.sub(r'\b\d{1,4}\b', convert_number, text)
         return text
 
     def _normalize_punctuation(self, text: str) -> str:
@@ -549,8 +708,10 @@ class My_TextNormalization_Model:
         text = text.replace('+', ' плюс ')
         text = text.replace('=', ' равно ')
         text = text.replace('№', 'номер ')
+        text = text.replace('*', ' звездочка ')
 
         text = re.sub(r'[()[\]{}]', '', text)
+
         text = re.sub(r'[.!?]+', '.', text)
         text = re.sub(r'[,;:]+', ',', text)
 
@@ -564,12 +725,16 @@ class My_TextNormalization_Model:
         return text
 
     def _number_to_words(self, num: int) -> str:
-        """Convert numbers to Russian words."""
+        """Convert numbers to Russian words with grammatical correctness."""
         if num == 0:
             return 'ноль'
 
+        if num < 0:
+            return f"минус {self._number_to_words(abs(num))}"
+
         if 1 <= num <= 19:
             return self.numbers[str(num)]
+
         elif 20 <= num <= 99:
             tens = (num // 10) * 10
             units = num % 10
@@ -577,6 +742,7 @@ class My_TextNormalization_Model:
                 return self.numbers[str(tens)]
             else:
                 return f"{self.numbers[str(tens)]} {self.numbers[str(units)]}"
+
         elif 100 <= num <= 999:
             hundreds = (num // 100) * 100
             remainder = num % 100
@@ -584,102 +750,106 @@ class My_TextNormalization_Model:
             if remainder > 0:
                 result += f" {self._number_to_words(remainder)}"
             return result
-        elif 1000 <= num <= 9999:
+
+        elif 1000 <= num <= 999999:
             thousands = num // 1000
             remainder = num % 1000
 
             if thousands == 1:
-                result = "тысяча"
-            elif 2 <= thousands <= 4:
-                result = f"{self.numbers[str(thousands)]} тысячи"
+                result = "одна тысяча"
+            elif thousands == 2:
+                result = "две тысячи"
+            elif 3 <= thousands <= 4:
+                result = f"{self._number_to_words(thousands)} тысячи"
             else:
-                result = f"{self.numbers[str(thousands)]} тысяч"
+                result = f"{self._number_to_words(thousands)} тысяч"
 
             if remainder > 0:
                 result += f" {self._number_to_words(remainder)}"
             return result
+
         else:
             return str(num)
 
     def _convert_decimal_number(self, number_str: str) -> str:
-        """Convert decimal numbers to words."""
+        """Convert decimal numbers to words with proper Russian forms."""
         number_str = number_str.replace(',', '.')
 
         try:
             if '.' in number_str:
                 integer_part, decimal_part = number_str.split('.')
-                integer_word = self._number_to_words(int(integer_part))
-                decimal_digits = ' '.join([self.numbers.get(digit, digit) for digit in decimal_part])
-                return f"{integer_word} целых {decimal_digits}"
+
+                if integer_part == '0' or integer_part == '':
+                    integer_word = 'ноль'
+                else:
+                    integer_word = self._number_to_words(int(integer_part))
+
+                if decimal_part == '0' or decimal_part == '':
+                    return integer_word
+
+                decimal_length = len(decimal_part)
+                if decimal_length == 1:
+                    denominator = "десятых"
+                elif decimal_length == 2:
+                    denominator = "сотых"
+                elif decimal_length == 3:
+                    denominator = "тысячных"
+                else:
+                    denominator = f"десяти в минус {decimal_length} степени"
+
+                decimal_int = int(decimal_part)
+                numerator = self._number_to_words(decimal_int)
+
+                return f"{integer_word} целых {numerator} {denominator}"
             else:
                 return self._number_to_words(int(number_str))
         except ValueError:
             return number_str
 
     def _convert_year(self, year: str) -> str:
-        """Convert year to spoken form."""
+        """Convert year to spoken form with special cases."""
         try:
             year_int = int(year)
-            if 1000 <= year_int <= 2099:
-                return self._number_to_words(year_int)
+
+            if 1000 <= year_int <= 1999:
+                century = year_int // 100
+                remainder = year_int % 100
+
+                if remainder == 0:
+                    century_key = str(century * 100 % 1000)
+                    if century_key in self.hundreds:
+                        return f"{self.hundreds[century_key]}й"
+                    else:
+                        return self._number_to_words(year_int)
+                else:
+                    century_key = str(century * 100 % 1000)
+                    if century_key in self.hundreds:
+                        return f"{self.hundreds[century_key]} {self._number_to_words(remainder)}"
+                    else:
+                        return self._number_to_words(year_int)
+            elif 2000 <= year_int <= 2099:
+                remainder = year_int % 100
+                if remainder == 0:
+                    return "двухтысячный"
+                else:
+                    return f"две тысячи {self._number_to_words(remainder)}"
             else:
-                return year
+                return self._number_to_words(year_int)
         except ValueError:
             return year
-
-    def _get_currency_word(self, currency: str) -> str:
-        """Get proper currency word."""
-        currency_map = {
-            '₽': 'рублей', 'руб': 'рублей', '$': 'долларов', '€': 'евро'
-        }
-        return currency_map.get(currency, currency)
-
-    def normalize_with_dict(self):
-        """Normalize text using dictionary approach."""
-        logger.info("Starting dictionary-based normalization...")
-
-        # Load dictionary
-        try:
-            with open(self.dictionary_path, 'r', encoding='utf-8') as f:
-                dictionary = json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load dictionary: {e}")
-            return None
-
-        try:
-            test = self.cleaner.safe_load_csv(self.test_path)
-            if test is None:
-                logger.error("Failed to load test data")
-                return None
-        except Exception as e:
-            logger.error(f"Failed to load test data: {e}")
-            return None
-
-        # Process test data
-        test['id'] = test['sentence_id'].astype(str) + '_' + test['token_id'].astype(str)
-        test['before_l'] = test['before'].str.lower()
-        test['after'] = test['before_l'].map(lambda x: dictionary.get(x, x))
-
-        def fix_case(original, lower, after):
-            if lower == after:
-                return original
-            else:
-                return after
-
-        test['after'] = test.apply(lambda r: fix_case(r['before'], r['before_l'], r['after']), axis=1)
-
-        return test
+            logger.error(f"Error converting year {year}: {e}")
+            return year
 
     def normalize_with_neural(self, test_mode=False):
         """
-        Normalize text using neural T5 model.
+        Normalize text using neural T5 model with improved preprocessing.
         Args:
             test_mode (bool): If True, only process first 10 items for testing
         """
         logger.info("Starting neural normalization with T5 model...")
 
         try:
-            # Load test data
             test = self.cleaner.safe_load_csv(self.test_path)
             if test is None:
                 logger.error("Failed to load test data")
@@ -696,7 +866,6 @@ class My_TextNormalization_Model:
             return
 
         try:
-            # Setup device and model
             MODEL_NAME = "saarus72/russian_text_normalizer"
             cache_dir = Path('models_cache')
 
@@ -708,7 +877,6 @@ class My_TextNormalization_Model:
                 logger.warning("CUDA not available. Using CPU.")
                 device = torch.device("cpu")
 
-            # Load model and tokenizer
             tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME, cache_dir=cache_dir)
             model = T5ForConditionalGeneration.from_pretrained(
                 MODEL_NAME,
@@ -738,18 +906,23 @@ class My_TextNormalization_Model:
             with torch.inference_mode():
                 for i in tqdm(range(0, len(test), batch_size)):
                     batch_texts = test['before'].iloc[i:i + batch_size].tolist()
+                    batch_classes = test['class'].iloc[i:i + batch_size].tolist() if 'class' in test.columns else None
 
                     formatted_texts = []
                     max_len = 0
-                    for text in batch_texts:
+                    for j, text in enumerate(batch_texts):
                         if any(c.isdigit() or (c.isascii() and c.isalpha()) for c in text):
+                            class_tag = f"[{batch_classes[j]}]" if batch_classes and batch_classes[j] else ""
+
                             if text.isdigit():
                                 text_rev = text[::-1]
-                                groups = [text_rev[i:i+3][::-1] for i in range(0, len(text_rev), 3)]
+                                groups = [text_rev[i:i + 3][::-1] for i in range(0, len(text_rev), 3)]
                                 text = ' '.join(groups[::-1])
-                            formatted_text = f"<SC1>[{text}]<extra_id_0>"
+
+                            formatted_text = f"<SC1>{class_tag}[{text}]<extra_id_0>"
                         else:
                             formatted_text = text
+
                         formatted_texts.append(formatted_text)
                         max_len = max(max_len, len(formatted_text))
 
@@ -767,7 +940,7 @@ class My_TextNormalization_Model:
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         max_length=min(max_len + 20, 128),
-                        num_beams=2,
+                        num_beams=3,
                         early_stopping=True,
                         do_sample=False,
                         use_cache=True,
@@ -778,14 +951,15 @@ class My_TextNormalization_Model:
 
                     cleaned_outputs = []
                     for output, original_text in zip(decoded_outputs, batch_texts):
-                        text = output.replace("<SC1>", "").replace("<extra_id_0>", "").strip()
-                        text = text.strip('[]')
-                        if not any(c.isdigit() or (c.isascii() and c.isalpha()) for c in original_text):
+                        if any(c.isdigit() or (c.isascii() and c.isalpha()) for c in original_text):
+                            text = output.replace("<SC1>", "").replace("<extra_id_0>", "").strip()
+                            text = text.strip('[]')
+                            text = re.sub(r'\[([A-Z_]+)\]', '', text).strip()
+                        else:
                             text = original_text
                         cleaned_outputs.append(text)
 
                     normalized_texts.extend(cleaned_outputs)
-
 
             results_df = pd.DataFrame({
                 'id': test['id'],
@@ -803,14 +977,14 @@ class My_TextNormalization_Model:
 
     def normalize_combined(self, test_mode=False):
         """
-        Combined normalization approach: dictionary first, then neural for remaining tokens.
+        Combined normalization approach with enhanced dictionary and targeted neural application.
         Args:
             test_mode (bool): If True, only process first 10 items for testing
         """
-        logger.info("Starting combined normalization (dictionary + neural)...")
+        logger.info("Starting enhanced combined normalization...")
 
         logger.info("Step 1: Applying dictionary normalization...")
-        dict_results = self.normalize_with_dict()
+        dict_results = self.normalize_text_dict()
         if dict_results is None:
             logger.error("Failed to perform dictionary normalization")
             return
@@ -818,7 +992,8 @@ class My_TextNormalization_Model:
         needs_neural = []
         for idx, row in dict_results.iterrows():
             if (row['before'] == row['after'] and
-                any(c.isdigit() or (c.isascii() and c.isalpha()) for c in row['before'])):
+                    any(c.isdigit() or (c.isascii() and c.isalpha()) for c in row['before']) and
+                    len(row['before']) > 1):
                 needs_neural.append(idx)
 
         logger.info(f"Found {len(needs_neural)} tokens requiring neural normalization")
@@ -829,7 +1004,7 @@ class My_TextNormalization_Model:
             dict_results[['id', 'after']].to_csv(output_path, index=False, encoding='utf-8')
             return
 
-        logger.info("Step 2: Applying neural normalization for remaining tokens...")
+        logger.info("Step 3: Applying neural normalization for selected tokens...")
 
         try:
             MODEL_NAME = "saarus72/russian_text_normalizer"
@@ -866,15 +1041,21 @@ class My_TextNormalization_Model:
             with torch.inference_mode():
                 for i in tqdm(range(0, len(neural_texts), batch_size)):
                     batch_texts = neural_texts['before'].iloc[i:i + batch_size].tolist()
+                    batch_classes = neural_texts['class'].iloc[
+                                    i:i + batch_size].tolist() if 'class' in neural_texts.columns else None
 
                     formatted_texts = []
                     max_len = 0
-                    for text in batch_texts:
+                    for j, text in enumerate(batch_texts):
+                        class_tag = f"[{batch_classes[j]}]" if batch_classes and j < len(batch_classes) and \
+                                                               batch_classes[j] else ""
+
                         if text.isdigit():
                             text_rev = text[::-1]
-                            groups = [text_rev[i:i+3][::-1] for i in range(0, len(text_rev), 3)]
+                            groups = [text_rev[i:i + 3][::-1] for i in range(0, len(text_rev), 3)]
                             text = ' '.join(groups[::-1])
-                        formatted_text = f"<SC1>[{text}]<extra_id_0>"
+
+                        formatted_text = f"<SC1>{class_tag}[{text}]<extra_id_0>"
                         formatted_texts.append(formatted_text)
                         max_len = max(max_len, len(formatted_text))
 
@@ -892,7 +1073,7 @@ class My_TextNormalization_Model:
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         max_length=min(max_len + 20, 128),
-                        num_beams=2,
+                        num_beams=3,
                         early_stopping=True,
                         do_sample=False,
                         use_cache=True,
@@ -905,6 +1086,7 @@ class My_TextNormalization_Model:
                     for output in decoded_outputs:
                         text = output.replace("<SC1>", "").replace("<extra_id_0>", "").strip()
                         text = text.strip('[]')
+                        text = re.sub(r'\[([A-Z_]+)\]', '', text).strip()
                         cleaned_outputs.append(text)
 
                     normalized_neural.extend(cleaned_outputs)
@@ -920,6 +1102,99 @@ class My_TextNormalization_Model:
         except Exception as e:
             logger.error(f"Error during neural normalization: {e}")
             return
+
+    def normalize_text(self, text: str) -> str:
+        """
+        Normalize a single text input using optimized combined approach.
+        This is the main API method for external applications.
+
+        Args:
+            text: Text to normalize
+
+        Returns:
+            Normalized text
+        """
+        if not text or not isinstance(text, str) or pd.isna(text):
+            return ""
+
+        try:
+            if not self.general_dict:
+                self.load_dictionaries()
+
+            text_lower = text.lower()
+
+            if text_lower in self.general_dict:
+                return self.general_dict[text_lower]
+
+            rule_result = self.normalize_with_rules(text)
+            if rule_result != text:
+                return rule_result
+
+            if any(c.isdigit() or (c.isascii() and c.isalpha()) for c in text):
+                try:
+                    if not hasattr(self, 'model') or self.model is None:
+                        MODEL_NAME = "saarus72/russian_text_normalizer"
+                        cache_dir = Path('models_cache')
+
+                        if torch.cuda.is_available():
+                            self.device = torch.device("cuda")
+                        else:
+                            self.device = torch.device("cpu")
+
+                        self.tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME, cache_dir=cache_dir)
+                        self.model = T5ForConditionalGeneration.from_pretrained(
+                            MODEL_NAME,
+                            cache_dir=cache_dir,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            low_cpu_mem_usage=True
+                        )
+
+                        self.model = self.model.to(self.device)
+                        self.model.eval()
+
+                    if text.isdigit():
+                        text_rev = text[::-1]
+                        groups = [text_rev[i:i + 3][::-1] for i in range(0, len(text_rev), 3)]
+                        formatted_text = ' '.join(groups[::-1])
+                    else:
+                        formatted_text = text
+
+                    formatted_input = f"<SC1>[{formatted_text}]<extra_id_0>"
+
+                    with torch.inference_mode():
+                        inputs = self.tokenizer(
+                            formatted_input,
+                            return_tensors="pt"
+                        )
+                        input_ids = inputs["input_ids"].to(self.device)
+                        attention_mask = inputs["attention_mask"].to(self.device)
+
+                        outputs = self.model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_length=128,
+                            num_beams=3,
+                            early_stopping=True,
+                            do_sample=False,
+                            use_cache=True,
+                            eos_token_id=self.tokenizer.eos_token_id
+                        )
+
+                        decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                        normalized = decoded_output.replace("<SC1>", "").replace("<extra_id_0>", "").strip()
+                        normalized = normalized.strip('[]')
+
+                        return normalized
+
+                except Exception as e:
+                    logger.error(f"Error in neural normalization: {e}")
+                    return text
+
+            return text
+
+        except Exception as e:
+            logger.error(f"Error in text normalization: {e}")
+            return text
 
     def create_submission(self):
         """Create final submission file."""
@@ -952,13 +1227,13 @@ def main():
     """Main function to run the text normalization."""
     parser = argparse.ArgumentParser(description="Enhanced Russian Text Normalization")
     parser.add_argument("mode", choices=["train", "normalize"],
-                       help="Operation mode: train or normalize")
+                        help="Operation mode: train or normalize")
     parser.add_argument("method", choices=["dictionary", "neural", "combined", "rules"],
-                       help="Method: dictionary, neural, combined, or rules")
+                        help="Method: dictionary, neural, combined, or rules")
     parser.add_argument("--test", action="store_true",
-                       help="Run in test mode (only 10 elements)")
+                        help="Run in test mode (only 10 elements)")
     parser.add_argument("--create-submission", action="store_true",
-                       help="Create submission file after normalization")
+                        help="Create submission file after normalization")
 
     args = parser.parse_args()
 
@@ -966,15 +1241,16 @@ def main():
 
     if args.mode == "train":
         if args.method == "dictionary":
-            normalizer.train_enhanced_dict()
+            normalizer.train_dict()
         else:
             logger.info(f"Training for {args.method} method not implemented yet")
 
     elif args.mode == "normalize":
         if args.method == "dictionary":
-            result = normalizer.normalize_with_dict()
+            result = normalizer.normalize_text_dict()
             if result is not None:
-                output_path = normalizer.result_path.replace('.csv', '_test.csv') if args.test else normalizer.result_path
+                output_path = normalizer.result_path.replace('.csv',
+                                                             '_test.csv') if args.test else normalizer.result_path
                 result[['id', 'after']].to_csv(output_path, index=False, encoding='utf-8')
                 logger.info(f"Dictionary normalization results saved to {output_path}")
 
@@ -994,7 +1270,8 @@ def main():
 
                     test['after'] = test['before'].apply(normalizer.normalize_with_rules)
 
-                    output_path = normalizer.result_path.replace('.csv', '_test.csv') if args.test else normalizer.result_path
+                    output_path = normalizer.result_path.replace('.csv',
+                                                                 '_test.csv') if args.test else normalizer.result_path
                     test[['id', 'after']].to_csv(output_path, index=False, encoding='utf-8')
                     logger.info(f"Rule-based normalization results saved to {output_path}")
                 else:

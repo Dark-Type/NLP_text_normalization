@@ -1,0 +1,43 @@
+name: "dictionary_normalizer"
+backend: "python"
+max_batch_size: 64
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+output [
+  {
+    name: "NORMALIZED"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "FOUND"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  }
+]
+dynamic_batching {
+  preferred_batch_size: [ 4, 16, 32, 64 ]
+}
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
+parameters {
+  key: "dictionary_path"
+  value: { string_value: "/models/dict/model_dictionary.json" }
+}
+parameters {
+  key: "class_dict_path"
+  value: { string_value: "/models/dict/class_dictionaries.json" }
+}
+parameters {
+  key: "special_dict_path"
+  value: { string_value: "/models/dict/special_cases.json" }
+}

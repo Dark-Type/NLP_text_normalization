@@ -1,0 +1,12 @@
+FROM nvcr.io/nvidia/tritonserver:22.12-py3-sdk
+
+WORKDIR /workspace
+
+COPY perf_data /workspace/perf_data
+
+RUN echo '#!/bin/bash\n\
+export CUDA_VISIBLE_DEVICES=""\n\
+perf_analyzer "$@"' > /workspace/run_perf.sh && \
+chmod +x /workspace/run_perf.sh
+
+ENTRYPOINT ["/workspace/run_perf.sh"]

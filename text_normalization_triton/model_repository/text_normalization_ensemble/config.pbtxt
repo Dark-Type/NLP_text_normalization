@@ -1,0 +1,53 @@
+name: "text_normalization_ensemble"
+platform: "ensemble"
+max_batch_size: 64
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+output [
+  {
+    name: "NORMALIZED_TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+ensemble_scheduling {
+  step [
+    {
+      model_name: "dictionary_normalizer"
+      model_version: -1
+      input_map {
+        key: "TEXT"
+        value: "TEXT"
+      }
+      output_map {
+        key: "NORMALIZED"
+        value: "DICT_NORMALIZED"
+      }
+      output_map {
+        key: "FOUND"
+        value: "DICT_FOUND"
+      }
+    },
+    {
+      model_name: "rule_normalizer"
+      model_version: -1
+      input_map {
+        key: "TEXT"
+        value: "TEXT"
+      }
+      output_map {
+        key: "NORMALIZED"
+        value: "RULE_NORMALIZED"
+      }
+      output_map {
+        key: "CHANGED"
+        value: "RULE_CHANGED"
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+services:
+  triton:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      - ./model_repository:/models
+    environment:
+      - OMP_NUM_THREADS=4
+      - CUDA_VISIBLE_DEVICES=''
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    depends_on:
+      - triton
+    environment:
+      - TRITON_SERVER_URL=triton:8000
