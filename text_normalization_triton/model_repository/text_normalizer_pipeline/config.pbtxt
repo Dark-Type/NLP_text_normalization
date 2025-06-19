@@ -1,6 +1,7 @@
-name: "rule_normalizer"
+name: "text_normalizer_pipeline"
 backend: "python"
-max_batch_size: 64
+max_batch_size: 0
+
 input [
   {
     name: "TEXT"
@@ -8,24 +9,23 @@ input [
     dims: [ 1 ]
   }
 ]
+
 output [
   {
-    name: "NORMALIZED"
+    name: "NORMALIZED_TEXT"
     data_type: TYPE_STRING
-    dims: [ 1 ]
-  },
-  {
-    name: "CHANGED"
-    data_type: TYPE_BOOL
     dims: [ 1 ]
   }
 ]
-dynamic_batching {
-  preferred_batch_size: [ 4, 16, 32, 64 ]
-}
+
 instance_group [
   {
     count: 1
     kind: KIND_CPU
   }
 ]
+
+parameters {
+  key: "FORCE_CPU_ONLY_INPUT_TENSORS"
+  value: { string_value: "yes" }
+}

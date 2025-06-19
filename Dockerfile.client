@@ -2,11 +2,27 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml poetry.lock* README.md ./
+
 RUN pip install poetry && \
     poetry config virtualenvs.create false && \
     poetry install --only=main --no-root
 
-COPY client /app/client
+COPY text_normalization_triton/client /app/client
 
-ENTRYPOINT ["python", "/app/client/client.py"]
+COPY <<EOF /app/wait-for-triton.sh
+#!/bin/bash
+echo "Waiting for Triton server to be ready..."
+while ! curl -f http://triton:8000/v2/health/ready 2>/dev/null; do
+    echo "Triton server not ready, waiting..."
+    sleep 5
+done
+echo "Triton server is ready!"
+exec "$@"
+EOF
+
+RUN chmod +x /app/wait-for-triton.sh
+
+ENTRYPOINT ["/app/wait-for-triton.sh", "python", "/app/client/client.py"]

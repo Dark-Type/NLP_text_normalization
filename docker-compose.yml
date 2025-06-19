@@ -8,20 +8,42 @@ services:
       - "8001:8001"
       - "8002:8002"
     volumes:
-      - ./model_repository:/models
+      - ./data:/app/data
+      - ./models_cache:/app/models_cache
+      - ./enhanced_text_normalization.py:/app/enhanced_text_normalization.py
     environment:
       - OMP_NUM_THREADS=4
       - CUDA_VISIBLE_DEVICES=''
+      - PYTHONPATH=/app
     deploy:
       resources:
         limits:
+          memory: 6G
+        reservations:
           memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/v2/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks:
+      - triton-network
 
-  client:
+  test-client:
     build:
       context: .
       dockerfile: Dockerfile.client
     depends_on:
-      - triton
+      triton:
+        condition: service_healthy
     environment:
       - TRITON_SERVER_URL=triton:8000
+    command: ["python", "/app/client/client.py", "--server", "triton:8000", "--test"]
+    restart: "no"
+    networks:
+      - triton-network
+
+networks:
+  triton-network:
+    driver: bridge

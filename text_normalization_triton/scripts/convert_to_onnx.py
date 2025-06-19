@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 def convert_model_to_onnx():
     """Convert the T5 model to ONNX format using optimum library."""
     try:
-        os.makedirs("../model_repository/text_normalizer/1", exist_ok=True)
+        os.makedirs("../../text_normalizer_onnx/1", exist_ok=True)
 
         MODEL_NAME = "saarus72/russian_text_normalizer"
         cache_dir = Path('../../models_cache')
@@ -22,7 +22,7 @@ def convert_model_to_onnx():
         logger.info(f"Loading model {MODEL_NAME}")
         tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME, cache_dir=cache_dir)
 
-        tokenizer.save_pretrained("model_repository/text_normalizer/tokenizer")
+        tokenizer.save_pretrained("model_repository/text_normalizer/tokenizer_files")
 
         logger.info("Converting model to ONNX with optimum...")
 
@@ -32,8 +32,7 @@ def convert_model_to_onnx():
             cache_dir=cache_dir
         )
 
-        # Save model in ONNX format
-        onnx_path = Path("../model_repository/text_normalizer/1")
+        onnx_path = Path("../../text_normalizer_onnx/1")
         ort_model.save_pretrained(onnx_path)
 
         logger.info(f"Model successfully converted to ONNX and saved to {onnx_path}")
@@ -51,7 +50,6 @@ def convert_model_to_onnx():
                 model_path.unlink()
                 quantized_model_path.rename(model_path)
 
-            # Quantize decoder model
             if decoder_path.exists():
                 logger.info("Quantizing decoder model...")
                 quantized_decoder_path = onnx_path / "decoder_model_quantized.onnx"
