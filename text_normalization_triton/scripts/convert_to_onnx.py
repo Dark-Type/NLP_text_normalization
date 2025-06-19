@@ -5,7 +5,6 @@ import torch
 from transformers import T5ForConditionalGeneration, GPT2Tokenizer
 from optimum.onnxruntime import ORTModelForSeq2SeqLM
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
