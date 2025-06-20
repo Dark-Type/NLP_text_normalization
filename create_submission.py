@@ -7,7 +7,6 @@ import logging
 import os
 from pathlib import Path
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,6 @@ def create_submission_from_results(result_file='data/results/result.csv',
         df = pd.read_csv(result_file, encoding='utf-8')
         logger.info(f"Loaded results with {len(df)} rows")
 
-        # Validate columns
         required_cols = ['id', 'after']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:

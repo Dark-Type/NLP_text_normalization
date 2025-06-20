@@ -1,7 +1,7 @@
 # Russian Text Normalization for TTS
 
-**Student:** Dark-Type  
-**Group:** [Your Group Number]
+**Student:** Skazhutin Nikita  
+**Group:** 972301 
 
 ## Description
 
